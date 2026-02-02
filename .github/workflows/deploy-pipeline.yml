@@ -71,16 +71,16 @@ jobs:
 
       - name: Deploy to Container App
         id: deploy
+        env:
+          APP_NAME: fastapi-${{ matrix.environment }}
+          IMAGE_FULL: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
         run: |
-          APP_NAME="fastapi-${{ matrix.environment }}"
-          IMAGE="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          
-          echo "Deploying $IMAGE to $APP_NAME..."
+          echo "Deploying $IMAGE_FULL to $APP_NAME..."
           
           az containerapp update \
             --name $APP_NAME \
             --resource-group ${{ env.RESOURCE_GROUP }} \
-            --image $IMAGE \
+            --image $IMAGE_FULL \
             --set-env-vars \
               APP_ENV=${{ matrix.environment }} \
               DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
@@ -98,7 +98,7 @@ jobs:
           echo "### 🚀 Deployed to ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
           echo "- **App**: $APP_NAME" >> $GITHUB_STEP_SUMMARY
           echo "- **URL**: https://$APP_URL" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: $IMAGE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: $IMAGE_FULL" >> $GITHUB_STEP_SUMMARY
 
       - name: Health Check
         run: |
