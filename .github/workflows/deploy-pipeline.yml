@@ -60,6 +60,22 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Login to ACR
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Configure Container App registry credentials
+        run: |
+          APP_NAME=fastapi-${{ matrix.environment }}
+          echo "Configuring registry credentials on $APP_NAME"
+          az containerapp update \
+            --name $APP_NAME \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --set configuration.registries="[{\"server\":\"${{ env.ACR_NAME }}.azurecr.io\",\"username\":\"${{ secrets.ACR_USERNAME }}\",\"password\":\"${{ secrets.ACR_PASSWORD }}\"}]"
+
       - name: Load Environment Variables
         id: load-env
         run: |
