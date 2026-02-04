@@ -123,12 +123,12 @@ jobs:
           echo "Assigning AcrPull to principal $PRINCIPAL_ID on $ACR_ID"
           az role assignment create --assignee-object-id "$PRINCIPAL_ID" --assignee-principal-type ServicePrincipal --role AcrPull --scope "$ACR_ID" || true
 
-          # Wait for role assignment to propagate (timeout ~180s)
-          echo "Waiting for AcrPull assignment to appear (timeout 180s)"
+          # Wait for role assignment to propagate (timeout ~300s)
+          echo "Waiting for AcrPull assignment to appear (timeout 300s)"
           attempt=0
           until az role assignment list --assignee-object-id "$PRINCIPAL_ID" --role AcrPull --scope "$ACR_ID" -o tsv | grep -q .; do
             attempt=$((attempt+1))
-            if [ $attempt -ge 36 ]; then
+            if [ $attempt -ge 60 ]; then
               echo "ERROR: AcrPull role assignment did not appear within timeout. Ensure the workflow's SP can create role assignments or assign AcrPull manually." >&2
               exit 1
             fi
@@ -147,6 +147,15 @@ jobs:
             --server ${{ env.ACR_NAME }}.azurecr.io \
             --identity system
 
+      - name: Inspect Container App identity and registries (debug)
+        run: |
+          set -euo pipefail
+          APP_NAME=fastapi-${{ matrix.environment }}
+          az containerapp show \
+            --name $APP_NAME \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "{identity:identity,registries:configuration.registries}" -o json
+
       - name: Load Environment Variables
         id: load-env
         run: |
@@ -164,8 +173,8 @@ jobs:
         run: |
           echo "Deploying $IMAGE_FULL to $APP_NAME..."
 
-          # Retry deploy on transient ACR auth errors (UNAUTHORIZED) - up to 5 attempts
-          max_attempts=5
+          # Retry deploy on transient ACR auth errors (UNAUTHORIZED) - up to 8 attempts
+          max_attempts=8
           attempt=1
           while [ $attempt -le $max_attempts ]; do
             echo "Deploy attempt $attempt/$max_attempts"
@@ -187,7 +196,7 @@ jobs:
 
               if echo "$OUTPUT" | grep -qiE "unauthorized|authentication required|401|access denied|cannot pull"; then
                 echo "Detected authentication/authorization error; will retry after backoff."
-                sleep_time=$((attempt * 6))
+                sleep_time=$((attempt * 8))
                 echo "Sleeping $sleep_time seconds before retry..."
                 sleep $sleep_time
                 attempt=$((attempt+1))
