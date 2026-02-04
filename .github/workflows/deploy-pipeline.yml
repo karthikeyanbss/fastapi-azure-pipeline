@@ -100,31 +100,44 @@ jobs:
           fi
 
           if [ "$APP_EXISTS" = "true" ]; then
-            # Get existing principal ID
-            PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv)
-            echo "Existing principal ID: $PRINCIPAL_ID"
+            # Check current target port
+            CURRENT_PORT=$(az containerapp show -n $APP_NAME -g $RG --query "properties.configuration.ingress.targetPort" -o tsv || echo "")
+            echo "Current target port: ${CURRENT_PORT:-not set}"
             
-            # Ensure role assignment exists
-            if [ -n "$PRINCIPAL_ID" ] && [ "$PRINCIPAL_ID" != "null" ]; then
-              echo "Ensuring AcrPull role assignment"
-              az role assignment create \
-                --assignee-object-id "$PRINCIPAL_ID" \
-                --assignee-principal-type ServicePrincipal \
-                --role AcrPull \
-                --scope "$ACR_ID" || true
-            fi
+            if [ "$CURRENT_PORT" != "$PORT" ]; then
+              echo "WARNING: Port mismatch detected (current: $CURRENT_PORT, required: $PORT)"
+              echo "Deleting and recreating Container App with correct port"
+              az containerapp delete --name $APP_NAME --resource-group $RG --yes
+              APP_EXISTS=false
+            else
+              # Get existing principal ID
+              PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv)
+              echo "Existing principal ID: $PRINCIPAL_ID"
+              
+              # Ensure role assignment exists
+              if [ -n "$PRINCIPAL_ID" ] && [ "$PRINCIPAL_ID" != "null" ]; then
+                echo "Ensuring AcrPull role assignment"
+                az role assignment create \
+                  --assignee-object-id "$PRINCIPAL_ID" \
+                  --assignee-principal-type ServicePrincipal \
+                  --role AcrPull \
+                  --scope "$ACR_ID" || true
+              fi
 
-            # Update the app
-            echo "Updating existing Container App"
-            az containerapp update \
-              --name $APP_NAME \
-              --resource-group $RG \
-              --image $IMAGE_FULL \
-              --set-env-vars \
-                APP_ENV=${{ matrix.environment }} \
-                DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
-                GIT_SHA=${{ github.sha }}
-          else
+              # Update the app
+              echo "Updating existing Container App"
+              az containerapp update \
+                --name $APP_NAME \
+                --resource-group $RG \
+                --image $IMAGE_FULL \
+                --set-env-vars \
+                  APP_ENV=${{ matrix.environment }} \
+                  DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+                  GIT_SHA=${{ github.sha }}
+            fi
+          fi
+          
+          if [ "$APP_EXISTS" = "false" ]; then
             # Create new app with identity
             echo "Creating new Container App"
             az containerapp create \
