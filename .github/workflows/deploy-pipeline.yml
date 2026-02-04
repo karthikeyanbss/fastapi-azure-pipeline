@@ -123,12 +123,12 @@ jobs:
           echo "Assigning AcrPull to principal $PRINCIPAL_ID on $ACR_ID"
           az role assignment create --assignee-object-id "$PRINCIPAL_ID" --assignee-principal-type ServicePrincipal --role AcrPull --scope "$ACR_ID" || true
 
-          # Wait for role assignment to propagate (timeout ~60s)
-          echo "Waiting for AcrPull assignment to appear (timeout 60s)"
+          # Wait for role assignment to propagate (timeout ~180s)
+          echo "Waiting for AcrPull assignment to appear (timeout 180s)"
           attempt=0
           until az role assignment list --assignee-object-id "$PRINCIPAL_ID" --role AcrPull --scope "$ACR_ID" -o tsv | grep -q .; do
             attempt=$((attempt+1))
-            if [ $attempt -ge 12 ]; then
+            if [ $attempt -ge 36 ]; then
               echo "ERROR: AcrPull role assignment did not appear within timeout. Ensure the workflow's SP can create role assignments or assign AcrPull manually." >&2
               exit 1
             fi
@@ -153,15 +153,35 @@ jobs:
           IMAGE_FULL: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
         run: |
           echo "Deploying $IMAGE_FULL to $APP_NAME..."
-          
-          az containerapp update \
-            --name $APP_NAME \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --image $IMAGE_FULL \
-            --set-env-vars \
-              APP_ENV=${{ matrix.environment }} \
-              DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
-              GIT_SHA=${{ github.sha }}
+
+          # Retry deploy on transient ACR auth errors (UNAUTHORIZED) - up to 5 attempts
+          max_attempts=5
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            echo "Deploy attempt $attempt/$max_attempts"
+            if az containerapp update \
+                --name $APP_NAME \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --image $IMAGE_FULL \
+                --set-env-vars \
+                  APP_ENV=${{ matrix.environment }} \
+                  DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+                  GIT_SHA=${{ github.sha }}; then
+              echo "Deploy succeeded on attempt $attempt"
+              break
+            else
+              echo "Deploy failed on attempt $attempt"
+              # Inspect error message for UNAUTHORIZED and retry after sleep
+              LAST_ERR=$(echo "$?" )
+              echo "Sleeping before retry..."
+              sleep $((attempt * 5))
+              attempt=$((attempt+1))
+            fi
+          done
+          if [ $attempt -gt $max_attempts ]; then
+            echo "ERROR: Deployment failed after $max_attempts attempts" >&2
+            exit 1
+          fi
           
           # Get the app URL
           APP_URL=$(az containerapp show \
