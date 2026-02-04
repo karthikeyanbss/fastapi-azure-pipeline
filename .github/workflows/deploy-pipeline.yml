@@ -78,28 +78,55 @@ jobs:
           ENV_NAME: ${{ env.CONTAINERAPPS_ENV }}
         run: |
           set -euo pipefail
-          echo "Deploying $IMAGE_FULL to $APP_NAME (create-or-update)"
+          echo "=== Deploying $IMAGE_FULL to $APP_NAME ==="
 
           RG=${{ env.RESOURCE_GROUP }}
           ACR_SERVER=${{ env.ACR_NAME }}.azurecr.io
           ACR_NAME=${{ env.ACR_NAME }}
           PORT=8000
 
-          # Detect if app exists
+          # Get ACR resource ID first
+          echo "Getting ACR resource ID"
+          ACR_ID=$(az acr show -n $ACR_NAME -g $RG --query id -o tsv)
+          echo "ACR ID: $ACR_ID"
+
+          # Check if app exists
+          APP_EXISTS=false
           if az containerapp show -n $APP_NAME -g $RG >/dev/null 2>&1; then
-            echo "App exists; updating image"
+            APP_EXISTS=true
+            echo "Container App exists"
+          else
+            echo "Container App does not exist - will create new"
+          fi
+
+          if [ "$APP_EXISTS" = "true" ]; then
+            # Get existing principal ID
+            PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv)
+            echo "Existing principal ID: $PRINCIPAL_ID"
+            
+            # Ensure role assignment exists
+            if [ -n "$PRINCIPAL_ID" ] && [ "$PRINCIPAL_ID" != "null" ]; then
+              echo "Ensuring AcrPull role assignment"
+              az role assignment create \
+                --assignee-object-id "$PRINCIPAL_ID" \
+                --assignee-principal-type ServicePrincipal \
+                --role AcrPull \
+                --scope "$ACR_ID" || true
+            fi
+
+            # Update the app
+            echo "Updating existing Container App"
             az containerapp update \
               --name $APP_NAME \
               --resource-group $RG \
               --image $IMAGE_FULL \
-              --registry-server $ACR_SERVER \
-              --registry-identity system \
               --set-env-vars \
                 APP_ENV=${{ matrix.environment }} \
                 DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
                 GIT_SHA=${{ github.sha }}
           else
-            echo "App not found; creating new Container App with system-assigned identity"
+            # Create new app with identity
+            echo "Creating new Container App"
             az containerapp create \
               --name $APP_NAME \
               --resource-group $RG \
@@ -116,35 +143,28 @@ jobs:
                 APP_ENV=${{ matrix.environment }} \
                 DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
                 GIT_SHA=${{ github.sha }}
-          fi
 
-          # Ensure system-assigned identity is enabled and get principal ID
-          echo "Verifying system-assigned identity"
-          PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv || echo "")
-          if [ -z "$PRINCIPAL_ID" ] || [ "$PRINCIPAL_ID" = "null" ]; then
-            echo "Enabling system-assigned identity"
-            az containerapp identity assign --name $APP_NAME --resource-group $RG --system-assigned
-            sleep 5
+            # Get the new principal ID
+            echo "Getting principal ID from newly created app"
+            sleep 10
             PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv)
+            echo "New principal ID: $PRINCIPAL_ID"
+
+            # Assign AcrPull role
+            if [ -n "$PRINCIPAL_ID" ] && [ "$PRINCIPAL_ID" != "null" ]; then
+              echo "Assigning AcrPull role to managed identity"
+              az role assignment create \
+                --assignee-object-id "$PRINCIPAL_ID" \
+                --assignee-principal-type ServicePrincipal \
+                --role AcrPull \
+                --scope "$ACR_ID"
+              echo "Waiting for role assignment to propagate"
+              sleep 20
+            else
+              echo "ERROR: Failed to get principal ID"
+              exit 1
+            fi
           fi
-
-          echo "Container App principal ID: $PRINCIPAL_ID"
-
-          # Get ACR resource ID
-          ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv)
-          echo "ACR resource ID: $ACR_ID"
-
-          # Assign AcrPull role to the container app's managed identity
-          echo "Assigning AcrPull role to managed identity"
-          az role assignment create \
-            --assignee-object-id "$PRINCIPAL_ID" \
-            --assignee-principal-type ServicePrincipal \
-            --role AcrPull \
-            --scope "$ACR_ID" 2>/dev/null || echo "Role assignment already exists or successfully created"
-
-          # Wait briefly for role propagation
-          echo "Waiting 30s for role assignment to propagate"
-          sleep 30
           
           # Get the app URL
           APP_URL=$(az containerapp show \
