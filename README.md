@@ -169,4 +169,35 @@ open http://localhost:8000/docs
 
 ## 📝 License
 
+## ⚙️ Deployment Notes (ACR & RBAC)
+
+- **Managed identity preferred**: The GitHub Actions workflow first attempts to grant the Container App's system-assigned identity the `AcrPull` role on your ACR so the Container App can pull images without storing credentials in GitHub. This requires the service principal used in `AZURE_CREDENTIALS` to have permission to create role assignments on the ACR resource (for example, Owner or User Access Administrator on the subscription or ACR scope).
+
+- **Fallback to ACR credentials**: If the workflow cannot create role assignments (insufficient permissions), it falls back to configuring registry credentials on the Container App using repository secrets. Add these Secrets in `Settings > Secrets and variables > Actions`:
+  - `AZURE_CREDENTIALS` — service principal JSON used by `azure/login`
+  - `ACR_NAME` — your ACR name (e.g., `nerfastapiacr`)
+  - `ACR_USERNAME` — ACR username (if using fallback)
+  - `ACR_PASSWORD` — ACR password (if using fallback)
+
+- **Create a service principal with AcrPull on the registry (alternative)**:
+
+```bash
+ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv)
+az ad sp create-for-rbac \
+  --name "github-actions-acr-puller" \
+  --role AcrPull \
+  --scopes $ACR_ID \
+  --sdk-auth
+```
+
+- **Granting role assignments manually (if needed)**:
+
+```bash
+# As a subscription owner or user-access-admin
+PRINCIPAL_ID=<container-app-principal-id>
+az role assignment create --assignee "$PRINCIPAL_ID" --role AcrPull --scope $ACR_ID
+```
+
+- After adding secrets or granting RBAC, re-run the workflow (push or manual dispatch) to deploy.
+
 MIT License - Feel free to use this template for your projects!
