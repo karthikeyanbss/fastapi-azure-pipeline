@@ -173,6 +173,8 @@ jobs:
               --name $APP_NAME \
               --resource-group ${{ env.RESOURCE_GROUP }} \
               --image $IMAGE_FULL \
+              --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+              --registry-identity system \
               --set-env-vars \
                 APP_ENV=${{ matrix.environment }} \
                 DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
