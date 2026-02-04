@@ -26,38 +26,6 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Log principals and ACR info (troubleshooting)
-        run: |
-          set -euo pipefail
-          APP_NAME=fastapi-${{ matrix.environment }}
-          RG=${{ env.RESOURCE_GROUP }}
-          ACR_NAME=${{ env.ACR_NAME }}
-
-          echo "--- Signed-in account ---"
-          az account show --query "{name:user.name, type:user.type, subscription:id}" -o json || echo "(unable to show account)"
-
-          echo "--- ACR info ---"
-          az acr show -n $ACR_NAME --query "{name:name, loginServer:loginServer, id:id}" -o json || echo "(unable to show acr)"
-
-          echo "--- Container App principal ---"
-          PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv || echo "")
-          echo "APP_NAME=$APP_NAME"
-          echo "PRINCIPAL_ID=${PRINCIPAL_ID:-<none>}"
-
-          if [ -n "$PRINCIPAL_ID" ]; then
-            echo "--- Role assignments for principal on ACR ---"
-            ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv || echo "")
-            if [ -n "$ACR_ID" ]; then
-              az role assignment list --assignee-object-id "$PRINCIPAL_ID" --scope "$ACR_ID" -o json || echo "(no role assignments or cannot query)"
-              echo "--- All AcrPull assignments on ACR ---"
-              az role assignment list --role AcrPull --scope "$ACR_ID" -o json || echo "(cannot list acrpull assignments)"
-            else
-              echo "(unable to resolve ACR_ID)"
-            fi
-          else
-            echo "(container app has no principal id)"
-          fi
-
       - name: Build and Push to ACR
         run: |
           echo "Building image: ${{ env.IMAGE_NAME }}:${{ github.sha }}"
@@ -91,6 +59,38 @@ jobs:
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Log principals and ACR info (troubleshooting)
+        run: |
+          set -euo pipefail
+          APP_NAME=fastapi-${{ matrix.environment }}
+          RG=${{ env.RESOURCE_GROUP }}
+          ACR_NAME=${{ env.ACR_NAME }}
+
+          echo "--- Signed-in account ---"
+          az account show --query "{name:user.name, type:user.type, subscription:id}" -o json || echo "(unable to show account)"
+
+          echo "--- ACR info ---"
+          az acr show -n $ACR_NAME --query "{name:name, loginServer:loginServer, id:id}" -o json || echo "(unable to show acr)"
+
+          echo "--- Container App principal ---"
+          PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv || echo "")
+          echo "APP_NAME=$APP_NAME"
+          echo "PRINCIPAL_ID=${PRINCIPAL_ID:-<none>}"
+
+          if [ -n "$PRINCIPAL_ID" ]; then
+            echo "--- Role assignments for principal on ACR ---"
+            ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv || echo "")
+            if [ -n "$ACR_ID" ]; then
+              az role assignment list --assignee-object-id "$PRINCIPAL_ID" --scope "$ACR_ID" -o json || echo "(no role assignments or cannot query)"
+              echo "--- All AcrPull assignments on ACR ---"
+              az role assignment list --role AcrPull --scope "$ACR_ID" -o json || echo "(cannot list acrpull assignments)"
+            else
+              echo "(unable to resolve ACR_ID)"
+            fi
+          else
+            echo "(container app has no principal id)"
+          fi
 
       - name: Ensure Container App can pull from ACR (require managed identity AcrPull)
         run: |
@@ -136,6 +136,16 @@ jobs:
           done
 
           echo "AcrPull role assignment confirmed. Proceeding with deployment using managed identity."
+
+      - name: Configure Container App registry to use managed identity
+        run: |
+          set -euo pipefail
+          APP_NAME=fastapi-${{ matrix.environment }}
+          az containerapp registry set \
+            --name $APP_NAME \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --server ${{ env.ACR_NAME }}.azurecr.io \
+            --identity system
 
       - name: Load Environment Variables
         id: load-env
