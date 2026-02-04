@@ -159,25 +159,38 @@ jobs:
           attempt=1
           while [ $attempt -le $max_attempts ]; do
             echo "Deploy attempt $attempt/$max_attempts"
-            if az containerapp update \
-                --name $APP_NAME \
-                --resource-group ${{ env.RESOURCE_GROUP }} \
-                --image $IMAGE_FULL \
-                --set-env-vars \
-                  APP_ENV=${{ matrix.environment }} \
-                  DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
-                  GIT_SHA=${{ github.sha }}; then
-              echo "Deploy succeeded on attempt $attempt"
-              break
+            OUTPUT=$(az containerapp update \
+              --name $APP_NAME \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --image $IMAGE_FULL \
+              --set-env-vars \
+                APP_ENV=${{ matrix.environment }} \
+                DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+                GIT_SHA=${{ github.sha }} 2>&1) || true
+
+            if echo "$OUTPUT" | grep -qi "provision revision" && echo "$OUTPUT" | grep -qi "error details"; then
+              # az returned an error; check for auth-related messages
+              echo "Deploy failed on attempt $attempt:"
+              echo "$OUTPUT" | sed -n '1,200p'
+
+              if echo "$OUTPUT" | grep -qiE "unauthorized|authentication required|401|access denied|cannot pull"; then
+                echo "Detected authentication/authorization error; will retry after backoff."
+                sleep_time=$((attempt * 6))
+                echo "Sleeping $sleep_time seconds before retry..."
+                sleep $sleep_time
+                attempt=$((attempt+1))
+                continue
+              else
+                echo "Non-auth error during deploy; failing immediately." >&2
+                exit 1
+              fi
             else
-              echo "Deploy failed on attempt $attempt"
-              # Inspect error message for UNAUTHORIZED and retry after sleep
-              LAST_ERR=$(echo "$?" )
-              echo "Sleeping before retry..."
-              sleep $((attempt * 5))
-              attempt=$((attempt+1))
+              # Assume success if no error text matched
+              echo "Deploy command completed; checking app status..."
+              break
             fi
           done
+
           if [ $attempt -gt $max_attempts ]; then
             echo "ERROR: Deployment failed after $max_attempts attempts" >&2
             exit 1
