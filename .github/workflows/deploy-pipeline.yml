@@ -61,102 +61,6 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Log principals and ACR info (troubleshooting)
-        run: |
-          set -euo pipefail
-          APP_NAME=fastapi-${{ matrix.environment }}
-          RG=${{ env.RESOURCE_GROUP }}
-          ACR_NAME=${{ env.ACR_NAME }}
-
-          echo "--- Signed-in account ---"
-          az account show --query "{name:user.name, type:user.type, subscription:id}" -o json || echo "(unable to show account)"
-
-          echo "--- ACR info ---"
-          az acr show -n $ACR_NAME --query "{name:name, loginServer:loginServer, id:id}" -o json || echo "(unable to show acr)"
-
-          echo "--- Container App principal ---"
-          PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv || echo "")
-          echo "APP_NAME=$APP_NAME"
-          echo "PRINCIPAL_ID=${PRINCIPAL_ID:-<none>}"
-
-          if [ -n "$PRINCIPAL_ID" ]; then
-            echo "--- Role assignments for principal on ACR ---"
-            ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv || echo "")
-            if [ -n "$ACR_ID" ]; then
-              az role assignment list --assignee-object-id "$PRINCIPAL_ID" --scope "$ACR_ID" -o json || echo "(no role assignments or cannot query)"
-              echo "--- All AcrPull assignments on ACR ---"
-              az role assignment list --role AcrPull --scope "$ACR_ID" -o json || echo "(cannot list acrpull assignments)"
-            else
-              echo "(unable to resolve ACR_ID)"
-            fi
-          else
-            echo "(container app has no principal id)"
-          fi
-
-      - name: Ensure Container App can pull from ACR (require managed identity AcrPull)
-        run: |
-          set -euo pipefail
-          APP_NAME=fastapi-${{ matrix.environment }}
-          RG=${{ env.RESOURCE_GROUP }}
-          ACR_NAME=${{ env.ACR_NAME }}
-
-          # Enable system-assigned identity if missing
-          PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv || echo "")
-          if [ -z "$PRINCIPAL_ID" ] || [ "$PRINCIPAL_ID" = "null" ]; then
-            echo "Enabling system-assigned identity for $APP_NAME"
-            az containerapp update -n $APP_NAME -g $RG --set identity.type=SystemAssigned
-            PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv)
-          fi
-
-          if [ -z "$PRINCIPAL_ID" ] || [ "$PRINCIPAL_ID" = "null" ]; then
-            echo "ERROR: failed to obtain container app principalId" >&2
-            exit 1
-          fi
-
-          # Get ACR resource id
-          ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv || echo "")
-          if [ -z "$ACR_ID" ]; then
-            echo "ERROR: failed to resolve ACR id for $ACR_NAME" >&2
-            exit 1
-          fi
-
-          # Assign AcrPull explicitly using object id to avoid Graph queries
-          echo "Assigning AcrPull to principal $PRINCIPAL_ID on $ACR_ID"
-          az role assignment create --assignee-object-id "$PRINCIPAL_ID" --assignee-principal-type ServicePrincipal --role AcrPull --scope "$ACR_ID" || true
-
-          # Wait for role assignment to propagate (timeout ~300s)
-          echo "Waiting for AcrPull assignment to appear (timeout 300s)"
-          attempt=0
-          until az role assignment list --assignee-object-id "$PRINCIPAL_ID" --role AcrPull --scope "$ACR_ID" -o tsv | grep -q .; do
-            attempt=$((attempt+1))
-            if [ $attempt -ge 60 ]; then
-              echo "ERROR: AcrPull role assignment did not appear within timeout. Ensure the workflow's SP can create role assignments or assign AcrPull manually." >&2
-              exit 1
-            fi
-            sleep 5
-          done
-
-          echo "AcrPull role assignment confirmed. Proceeding with deployment using managed identity."
-
-      - name: Configure Container App registry to use managed identity
-        run: |
-          set -euo pipefail
-          APP_NAME=fastapi-${{ matrix.environment }}
-          az containerapp registry set \
-            --name $APP_NAME \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --server ${{ env.ACR_NAME }}.azurecr.io \
-            --identity system
-
-      - name: Inspect Container App identity and registries (debug)
-        run: |
-          set -euo pipefail
-          APP_NAME=fastapi-${{ matrix.environment }}
-          az containerapp show \
-            --name $APP_NAME \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --query "{identity:identity,registries:configuration.registries}" -o json
-
       - name: Load Environment Variables
         id: load-env
         run: |
@@ -165,6 +69,7 @@ jobs:
             echo "Loading variables from infra/${{ matrix.environment }}.env"
             cat infra/${{ matrix.environment }}.env
           fi
+
       - name: Deploy or create Container App
         id: deploy
         env:
@@ -177,6 +82,7 @@ jobs:
 
           RG=${{ env.RESOURCE_GROUP }}
           ACR_SERVER=${{ env.ACR_NAME }}.azurecr.io
+          ACR_NAME=${{ env.ACR_NAME }}
           PORT=8000
 
           # Detect if app exists
@@ -193,7 +99,7 @@ jobs:
                 DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
                 GIT_SHA=${{ github.sha }}
           else
-            echo "App not found; creating new Container App"
+            echo "App not found; creating new Container App with system-assigned identity"
             az containerapp create \
               --name $APP_NAME \
               --resource-group $RG \
@@ -203,13 +109,42 @@ jobs:
               --ingress external \
               --registry-server $ACR_SERVER \
               --registry-identity system \
+              --system-assigned \
               --min-replicas 1 \
               --max-replicas 3 \
-              --set-env-vars \
+              --env-vars \
                 APP_ENV=${{ matrix.environment }} \
                 DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
                 GIT_SHA=${{ github.sha }}
           fi
+
+          # Ensure system-assigned identity is enabled and get principal ID
+          echo "Verifying system-assigned identity"
+          PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv || echo "")
+          if [ -z "$PRINCIPAL_ID" ] || [ "$PRINCIPAL_ID" = "null" ]; then
+            echo "Enabling system-assigned identity"
+            az containerapp identity assign --name $APP_NAME --resource-group $RG --system-assigned
+            sleep 5
+            PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv)
+          fi
+
+          echo "Container App principal ID: $PRINCIPAL_ID"
+
+          # Get ACR resource ID
+          ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv)
+          echo "ACR resource ID: $ACR_ID"
+
+          # Assign AcrPull role to the container app's managed identity
+          echo "Assigning AcrPull role to managed identity"
+          az role assignment create \
+            --assignee-object-id "$PRINCIPAL_ID" \
+            --assignee-principal-type ServicePrincipal \
+            --role AcrPull \
+            --scope "$ACR_ID" 2>/dev/null || echo "Role assignment already exists or successfully created"
+
+          # Wait briefly for role propagation
+          echo "Waiting 30s for role assignment to propagate"
+          sleep 30
           
           # Get the app URL
           APP_URL=$(az containerapp show \
@@ -224,6 +159,7 @@ jobs:
           echo "- **App**: $APP_NAME" >> $GITHUB_STEP_SUMMARY
           echo "- **URL**: https://$APP_URL" >> $GITHUB_STEP_SUMMARY
           echo "- **Image**: $IMAGE_FULL" >> $GITHUB_STEP_SUMMARY
+          echo "- **Principal ID**: $PRINCIPAL_ID" >> $GITHUB_STEP_SUMMARY
 
       - name: Health Check
         run: |
