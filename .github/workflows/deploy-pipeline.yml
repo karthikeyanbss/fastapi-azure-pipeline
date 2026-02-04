@@ -26,6 +26,38 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Log principals and ACR info (troubleshooting)
+        run: |
+          set -euo pipefail
+          APP_NAME=fastapi-${{ matrix.environment }}
+          RG=${{ env.RESOURCE_GROUP }}
+          ACR_NAME=${{ env.ACR_NAME }}
+
+          echo "--- Signed-in account ---"
+          az account show --query "{name:user.name, type:user.type, subscription:id}" -o json || echo "(unable to show account)"
+
+          echo "--- ACR info ---"
+          az acr show -n $ACR_NAME --query "{name:name, loginServer:loginServer, id:id}" -o json || echo "(unable to show acr)"
+
+          echo "--- Container App principal ---"
+          PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv || echo "")
+          echo "APP_NAME=$APP_NAME"
+          echo "PRINCIPAL_ID=${PRINCIPAL_ID:-<none>}"
+
+          if [ -n "$PRINCIPAL_ID" ]; then
+            echo "--- Role assignments for principal on ACR ---"
+            ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv || echo "")
+            if [ -n "$ACR_ID" ]; then
+              az role assignment list --assignee-object-id "$PRINCIPAL_ID" --scope "$ACR_ID" -o json || echo "(no role assignments or cannot query)"
+              echo "--- All AcrPull assignments on ACR ---"
+              az role assignment list --role AcrPull --scope "$ACR_ID" -o json || echo "(cannot list acrpull assignments)"
+            else
+              echo "(unable to resolve ACR_ID)"
+            fi
+          else
+            echo "(container app has no principal id)"
+          fi
+
       - name: Build and Push to ACR
         run: |
           echo "Building image: ${{ env.IMAGE_NAME }}:${{ github.sha }}"
@@ -60,45 +92,50 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Ensure Container App can pull from ACR (try managed identity, fallback to secrets)
+      - name: Ensure Container App can pull from ACR (require managed identity AcrPull)
         run: |
           set -euo pipefail
           APP_NAME=fastapi-${{ matrix.environment }}
           RG=${{ env.RESOURCE_GROUP }}
           ACR_NAME=${{ env.ACR_NAME }}
 
-          # Try to enable system-assigned identity if missing
+          # Enable system-assigned identity if missing
           PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv || echo "")
           if [ -z "$PRINCIPAL_ID" ] || [ "$PRINCIPAL_ID" = "null" ]; then
             echo "Enabling system-assigned identity for $APP_NAME"
-            az containerapp update -n $APP_NAME -g $RG --set identity.type=SystemAssigned || true
-            PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv || echo "")
+            az containerapp update -n $APP_NAME -g $RG --set identity.type=SystemAssigned
+            PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv)
           fi
 
-          ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv || echo "")
+          if [ -z "$PRINCIPAL_ID" ] || [ "$PRINCIPAL_ID" = "null" ]; then
+            echo "ERROR: failed to obtain container app principalId" >&2
+            exit 1
+          fi
 
-          if [ -n "$PRINCIPAL_ID" ] && [ -n "$ACR_ID" ]; then
-            echo "Attempting to assign AcrPull to principal $PRINCIPAL_ID on $ACR_ID"
-            if az role assignment create --assignee "$PRINCIPAL_ID" --role "AcrPull" --scope "$ACR_ID"; then
-              echo "AcrPull role assigned successfully. Using managed identity to pull images."
-            else
-              echo "Warning: role assignment failed or insufficient permissions. Falling back to registry credentials." >&2
-              # Fallback to setting registry credentials using secrets
-              if [ -z "${{ secrets.ACR_USERNAME }}" ] || [ -z "${{ secrets.ACR_PASSWORD }}" ]; then
-                echo "ERROR: ACR credentials not found in secrets (ACR_USERNAME/ACR_PASSWORD). Cannot configure fallback." >&2
-                exit 1
-              fi
-              echo "Configuring registry credentials on $APP_NAME using provided secrets"
-              az containerapp update --name $APP_NAME --resource-group $RG --set configuration.registries="[{\"server\":\"${ACR_NAME}.azurecr.io\",\"username\":\"${{ secrets.ACR_USERNAME }}\",\"password\":\"${{ secrets.ACR_PASSWORD }}\"}]"
-            fi
-          else
-            echo "Principal ID or ACR ID missing; attempting to configure registry credentials fallback"
-            if [ -z "${{ secrets.ACR_USERNAME }}" ] || [ -z "${{ secrets.ACR_PASSWORD }}" ]; then
-              echo "ERROR: ACR credentials not found in secrets (ACR_USERNAME/ACR_PASSWORD). Cannot configure fallback." >&2
+          # Get ACR resource id
+          ACR_ID=$(az acr show -n $ACR_NAME --query id -o tsv || echo "")
+          if [ -z "$ACR_ID" ]; then
+            echo "ERROR: failed to resolve ACR id for $ACR_NAME" >&2
+            exit 1
+          fi
+
+          # Assign AcrPull explicitly using object id to avoid Graph queries
+          echo "Assigning AcrPull to principal $PRINCIPAL_ID on $ACR_ID"
+          az role assignment create --assignee-object-id "$PRINCIPAL_ID" --assignee-principal-type ServicePrincipal --role AcrPull --scope "$ACR_ID" || true
+
+          # Wait for role assignment to propagate (timeout ~60s)
+          echo "Waiting for AcrPull assignment to appear (timeout 60s)"
+          attempt=0
+          until az role assignment list --assignee-object-id "$PRINCIPAL_ID" --role AcrPull --scope "$ACR_ID" -o tsv | grep -q .; do
+            attempt=$((attempt+1))
+            if [ $attempt -ge 12 ]; then
+              echo "ERROR: AcrPull role assignment did not appear within timeout. Ensure the workflow's SP can create role assignments or assign AcrPull manually." >&2
               exit 1
             fi
-            az containerapp update --name $APP_NAME --resource-group $RG --set configuration.registries="[{\"server\":\"${ACR_NAME}.azurecr.io\",\"username\":\"${{ secrets.ACR_USERNAME }}\",\"password\":\"${{ secrets.ACR_PASSWORD }}\"}]"
-          fi
+            sleep 5
+          done
+
+          echo "AcrPull role assignment confirmed. Proceeding with deployment using managed identity."
 
       - name: Load Environment Variables
         id: load-env
