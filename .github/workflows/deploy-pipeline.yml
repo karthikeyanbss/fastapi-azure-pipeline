@@ -45,8 +45,9 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     strategy:
+      # Temporarily restrict deployment to `dev` only while debugging
       matrix:
-        environment: [dev, qa, prod]
+        environment: [dev]
     
     environment:
       name: ${{ matrix.environment }}
@@ -117,11 +118,16 @@ jobs:
               # Ensure role assignment exists
               if [ -n "$PRINCIPAL_ID" ] && [ "$PRINCIPAL_ID" != "null" ]; then
                 echo "Ensuring AcrPull role assignment"
-                az role assignment create \
-                  --assignee-object-id "$PRINCIPAL_ID" \
-                  --assignee-principal-type ServicePrincipal \
-                  --role AcrPull \
-                  --scope "$ACR_ID" || true
+                # Try to add role assignment with a few retries to handle propagation delays
+                for i in 1 2 3 4 5; do
+                  az role assignment create \
+                    --assignee "$PRINCIPAL_ID" \
+                    --role AcrPull \
+                    --scope "$ACR_ID" && break || {
+                      echo "Attempt $i: role assignment failed, retrying...";
+                      sleep $((i * 5));
+                    }
+                done || true
               fi
 
               # Update the app
@@ -163,14 +169,18 @@ jobs:
             PRINCIPAL_ID=$(az containerapp show -n $APP_NAME -g $RG --query identity.principalId -o tsv)
             echo "New principal ID: $PRINCIPAL_ID"
 
-            # Assign AcrPull role
+            # Assign AcrPull role with retries
             if [ -n "$PRINCIPAL_ID" ] && [ "$PRINCIPAL_ID" != "null" ]; then
               echo "Assigning AcrPull role to managed identity"
-              az role assignment create \
-                --assignee-object-id "$PRINCIPAL_ID" \
-                --assignee-principal-type ServicePrincipal \
-                --role AcrPull \
-                --scope "$ACR_ID"
+              for i in 1 2 3 4 5; do
+                az role assignment create \
+                  --assignee "$PRINCIPAL_ID" \
+                  --role AcrPull \
+                  --scope "$ACR_ID" && break || {
+                    echo "Attempt $i: role assignment failed, retrying...";
+                    sleep $((i * 5));
+                  }
+              done
               echo "Waiting for role assignment to propagate"
               sleep 20
             else
